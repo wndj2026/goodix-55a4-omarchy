@@ -1,0 +1,49 @@
+#!/bin/bash
+# Rebuild + reinstall the Goodix 27c6:55a4 fingerprint driver on Omarchy/Arch.
+# Needed after a system update if fprintd stops seeing the sensor.
+# Safe to re-run any time. Enrolled fingerprints are kept.
+set -e
+
+REPO="$HOME/.local/share/goodix-55a4"
+
+echo "=== 0/4 Updating driver repo ==="
+if [[ -d "$REPO/.git" ]]; then
+  git -C "$REPO" pull --ff-only 2>/dev/null || echo "(offline or diverged, using local copy)"
+else
+  git clone https://github.com/Hydrogell/goodix-27c6-55a4-fingerprint-linux "$REPO"
+fi
+
+echo "=== 1/4 Installing build dependencies (Arch) ==="
+sudo pacman -S --needed --noconfirm \
+  meson ninja gcc cmake pkgconf git python3 \
+  libfprint glib2 glib2-devel libgusb nss openssl cairo \
+  gobject-introspection opencv doctest base-devel python-virtualenv
+
+# Arch ships opencv5, the driver asks for opencv4 via pkg-config.
+# Shim it if there is no real opencv4.
+if ! pkg-config --exists opencv4 2>/dev/null; then
+  echo "Shimming opencv4 -> opencv5 for the build..."
+  SHIMDIR="$(mktemp -d)"
+  cp /usr/lib/pkgconfig/opencv5.pc "$SHIMDIR/opencv4.pc"
+  sed -i 's/^Name:.*/Name: opencv4/' "$SHIMDIR/opencv4.pc"
+  export PKG_CONFIG_PATH="$SHIMDIR${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+fi
+
+echo "=== 2/4 Fixing udev rule (Arch has no plugdev group; keep autosuspend off) ==="
+sudo tee /etc/udev/rules.d/99-goodix-fp.rules >/dev/null <<'EOF'
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="55a4", TAG+="uaccess", TEST=="power/control", ATTR{power/control}="on"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="27c6", ATTRS{idProduct}=="55b4", TAG+="uaccess", TEST=="power/control", ATTR{power/control}="on"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=27c6 || true
+
+echo "=== 3/4 Building + installing (asks for sudo once) ==="
+cd "$REPO"
+./install.sh
+
+echo "=== 4/4 Verifying ==="
+fprintd-list "$USER" || true
+echo
+echo "If the Goodix 55X4 device is listed above, re-enroll if needed:"
+echo "  fprintd-enroll -f right-index-finger"
+echo "  omarchy setup security fingerprint   # re-wires sudo/polkit/lock PAM"
