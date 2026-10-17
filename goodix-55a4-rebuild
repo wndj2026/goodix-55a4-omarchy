@@ -15,7 +15,7 @@ fi
 
 echo "=== 1/4 Installing build dependencies (Arch) ==="
 sudo pacman -S --needed --noconfirm \
-  meson ninja gcc cmake pkgconf git python3 \
+  meson ninja gcc cmake pkgconf git python3 python-pyusb \
   libfprint glib2 glib2-devel libgusb nss openssl cairo \
   gobject-introspection opencv doctest base-devel python-virtualenv
 
@@ -40,6 +40,79 @@ sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=27c6 || true
 echo "=== 3/4 Building + installing (asks for sudo once) ==="
 cd "$REPO"
 ./install.sh
+
+echo "=== 3b/4 Installing PSK autofix (official goodix-fp-dump driver) ==="
+# The custom autofix protocol timed out on GF3208; the official
+# provision_psk.py from goodix-fp-dump works. Install it permanently
+# at /opt/goodix-fp-dump with a venv, and never start fprintd from
+# inside the autofix — fprintd's drop-in orders it After= this unit,
+# so starting it there deadlocks (sensor LED stays dark).
+DUMP_SRC="$REPO/work/goodix-fp-dump"
+if [[ ! -d "$DUMP_SRC" ]]; then
+  DUMP_URL="https://github.com/goodix-fp-linux-dev/goodix-fp-dump.git"
+  DUMP_REV="cc43bb3b3154a0bccc0412ae024013c7e1923139"
+  DUMP_SRC="$(mktemp -d -p /var/tmp goodix-dump.XXXXXXXX)"
+  git clone -q "$DUMP_URL" "$DUMP_SRC"
+  git -C "$DUMP_SRC" checkout -q "$DUMP_REV"
+fi
+sudo mkdir -p /opt/goodix-fp-dump
+sudo cp "$DUMP_SRC"/*.py /opt/goodix-fp-dump/
+if [[ ! -x /opt/goodix-fp-dump/.venv/bin/python ]]; then
+  sudo python3 -m venv /opt/goodix-fp-dump/.venv
+  sudo /opt/goodix-fp-dump/.venv/bin/pip install -q pyusb crcmod python-periphery
+  printf 'class SpiDev:\n    pass\n' | sudo tee /opt/goodix-fp-dump/spidev.py >/dev/null
+fi
+sudo install -m0755 "$REPO/scripts/provision_psk.py" /opt/goodix-fp-dump/
+sudo chmod -R a+rX /opt/goodix-fp-dump
+
+sudo tee /usr/local/bin/goodix-psk-autofix >/dev/null <<'EOF'
+#!/bin/bash
+# Re-provision the Goodix 55a4 PSK. Does NOT start fprintd: the drop-in
+# orders fprintd After= this unit, so starting it here deadlocks.
+set -u
+DUMP=/opt/goodix-fp-dump
+cd "$DUMP" || exit 0
+systemctl stop fprintd.service 2>/dev/null || true
+pkill -TERM -x fprintd 2>/dev/null || true
+sleep 1
+pkill -9 -x fprintd 2>/dev/null || true
+sleep 1
+PYTHONDONTWRITEBYTECODE=1 exec .venv/bin/python provision_psk.py
+EOF
+sudo chmod 755 /usr/local/bin/goodix-psk-autofix
+
+sudo tee /etc/systemd/system/goodix-psk-autofix.service >/dev/null <<'EOF'
+[Unit]
+Description=Goodix Fingerprint PSK Auto-Fix
+Before=fprintd.service
+ConditionPathExists=/usr/local/bin/goodix-psk-autofix
+ConditionPathExists=/opt/goodix-fp-dump
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/goodix-psk-autofix
+RemainAfterExit=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateDevices=no
+DeviceAllow=char-usb_device rw
+ReadWritePaths=/dev/bus/usb /run/systemd
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo tee /etc/systemd/system/fprintd.service.d/10-goodix55a4.conf >/dev/null <<'EOF'
+[Unit]
+After=goodix-psk-autofix.service
+Wants=goodix-psk-autofix.service
+[Service]
+Environment=LD_LIBRARY_PATH=/opt/libfprint-goodix/lib64
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable goodix-psk-autofix.service || true
+sudo systemctl restart fprintd.service || true
 
 echo "=== 4/4 Verifying ==="
 fprintd-list "$USER" || true
