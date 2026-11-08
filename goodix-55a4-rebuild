@@ -16,7 +16,7 @@ fi
 echo "=== 1/4 Installing build dependencies (Arch) ==="
 sudo pacman -S --needed --noconfirm \
   meson ninja gcc cmake pkgconf git python3 python-pyusb \
-  libfprint glib2 glib2-devel libgusb nss openssl cairo \
+  glib2 glib2-devel libgusb nss openssl cairo \
   gobject-introspection opencv doctest base-devel python-virtualenv
 
 # Arch ships opencv5, the driver asks for opencv4 via pkg-config.
@@ -39,6 +39,25 @@ sudo udevadm trigger --subsystem-match=usb --attr-match=idVendor=27c6 || true
 
 echo "=== 3/4 Building + installing (asks for sudo once) ==="
 cd "$REPO"
+# Looser sigfm matcher (upstream default 5). With 5, fprintd-verify captured
+# images forever without a result on this unit; 4 matches reliably. Override
+# with GOODIX_MIN_MATCH=5 to restore upstream. install.sh in the driver repo has
+# no such knob, so add it idempotently before running it.
+export GOODIX_MIN_MATCH="${GOODIX_MIN_MATCH:-4}"
+if ! grep -q GOODIX_MIN_MATCH install.sh; then
+  python3 - <<'PY'
+import re
+s = open("install.sh").read()
+anchor = 'git -C "$BUILD/libfprint" apply "$REPO/patches/55a4-driver.patch"\n'
+hook = anchor + (
+    'if [ -n "${GOODIX_MIN_MATCH:-}" ]; then\n'
+    '  sed -i "s/^constexpr auto min_match = [0-9]*;/constexpr auto min_match = ${GOODIX_MIN_MATCH};/" \\\n'
+    '    "$BUILD/libfprint/libfprint/sigfm/sigfm.cpp"\n'
+    'fi\n')
+assert anchor in s, "install.sh layout changed; min_match hook not applied"
+open("install.sh", "w").write(s.replace(anchor, hook, 1))
+PY
+fi
 ./install.sh
 
 echo "=== 3b/4 Installing PSK autofix (official goodix-fp-dump driver) ==="

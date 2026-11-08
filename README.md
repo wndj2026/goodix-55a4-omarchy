@@ -35,9 +35,13 @@ upstream `libfprint` release supports as of 2026.
 3. Arch build deps the READMEs don't all mention: `glib2-devel` (provides
    `glib-mkenums`), `cmake`, `doctest`, plus an `opencv4 → opencv5` pkg-config
    shim (Arch ships OpenCV 5; the driver asks for `opencv4`).
-4. PAM wiring identical to `omarchy setup security fingerprint`
-   (`sudo`, `polkit-1`, `omarchy-lock-fingerprint`), applied after a print
-   enrolled even though `fprintd-verify` stayed flaky on this unit.
+4. **`min_match` 5 → 4** in the sigfm matcher (the rebuild script does this
+   by default; `GOODIX_MIN_MATCH=5` restores upstream). With 5, `fprintd-verify`
+   on this unit captured image after image for ~10 s and never returned a
+   result; with 4 (plus a firm, steady press) it returns `verify-match`. This is what fixed the
+   "flaky verify".
+5. PAM wiring identical to `omarchy setup security fingerprint`
+   (`sudo`, `polkit-1`, `omarchy-lock-fingerprint`) — see below.
 
 Also tried and abandoned: `GuNanOvO/goodix-55x4-linux` (targets `55b4`/
 `GF3268`; patched locally for the `GF3208` firmware prefix and the missing
@@ -64,6 +68,23 @@ omarchy setup security fingerprint  # wires sudo/polkit/lock PAM
 ("Rebuild Fingerprint Driver") so it can be re-run from the launcher after a
 system update breaks the sensor. Enrolled prints survive rebuilds.
 
+### Wire PAM (sudo / polkit / lock screen)
+
+`omarchy setup security fingerprint` re-enrolls, then runs its own verify, and
+**aborts before wiring PAM if that verify fails** — its wrapper can report
+`verify-unknown-error` even when plain `fprintd-verify` matches. So check
+`fprintd-verify` yourself first. If it prints `verify-match` but the omarchy
+script keeps failing, wire PAM by hand (keep a root shell open while testing;
+the line is `sufficient`, so a failed scan falls back to the password):
+
+```bash
+sudo sed -i '1i auth      sufficient pam_fprintd.so' /etc/pam.d/sudo
+sudo sed -i '/pam_fprintd\.so/i auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed' /etc/pam.d/sudo
+sudo -k && sudo true   # touch the sensor
+```
+
+When verifying, press firmly and hold still for 2–3 s; don't tap.
+
 ## Troubleshooting
 
 | Symptom | Likely cause / fix |
@@ -71,6 +92,8 @@ system update breaks the sensor. Enrolled prints survive rebuilds.
 | `No devices available` | Stock libfprint; (re)run the rebuild script |
 | `Invalid device firmware: GF3208…` | Old `55b4`-only driver; use the Hydrogell-based build here |
 | `enroll-unknown-error` + `device removed` | USB reset race; wait ~10 s, retry. Check `power/control` is `on`: `cat /sys/bus/usb/devices/*/power/control` for the `27c6` device |
+| `fprintd-verify` captures for ~10 s, then `verify-unknown-error` + `device removed` | Matcher too strict for this unit. Rebuild (default now `min_match=4`). The USB disconnect is a side effect of the verify being killed mid-capture, not the cause |
+| Rebuild fails at `libfprint and libfprint-git are in conflict` | You have `libfprint-git`; the script no longer asks pacman for plain `libfprint` |
 | `verify-no-match` on the right finger | Weak template or strict matcher; delete (`fprintd-delete`) and re-enroll with better coverage |
 | `glib-mkenums` missing at build | `sudo pacman -S glib2-devel` (handled by the script) |
 | `opencv4 not found` at build | Arch OpenCV 5 shim (handled by the script) |
@@ -81,8 +104,9 @@ system update breaks the sensor. Enrolled prints survive rebuilds.
   encryption only, no host authentication. Fine for laptop login; don't rely on
   it alone for high-security use.
 - Field-calibrated on very few units. If capture is unreliable, the upstream
-  knob is `GOODIX55X4_TOUCH_DIFF=200`; if matching is too strict, `min_match`
-  `5→4` in the sigfm matcher (requires rebuild).
+  knob is `GOODIX55X4_TOUCH_DIFF=200`; if matching is too strict, lower `min_match`
+  further (default here is already 4; set `GOODIX_MIN_MATCH=3` and rebuild —
+  lower values raise the false-accept rate).
 - Dual-boot Windows rewrites the sensor PSK on its boots; the provision step in
   `install.sh` plus a PSK auto-fix service handles the round-trip.
 
